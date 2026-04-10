@@ -81,7 +81,7 @@ CREATE TABLE Persons (
     gender       ENUM('Male','Female','Other') NOT NULL,
     date_of_birth DATE,
     national_id  VARCHAR(20)  NOT NULL,           -- national ID card number
-    phone        VARCHAR(20),// small update on the phone number
+    phone   VARCHAR(20),      --small update on phone number
 CONSTRAINT chk_phone CHECK (phone IS NULL OR phone REGEXP '^[0-9+][0-9 ]{6,19}$'),
     email        VARCHAR(100),
     district_id  INT          NOT NULL,            -- which district this person lives in
