@@ -39,7 +39,7 @@ CREATE TABLE Persons (
     Email         VARCHAR(120)    NULL,
     Address       VARCHAR(255)    NULL,
     CONSTRAINT uq_national_id UNIQUE (National_ID),
-    CONSTRAINT chk_dob CHECK (Date_of_birth < CURDATE()),
+    CONSTRAINT chk_dob CHECK (Date_of_birth < '2026-01-01'),  
     CONSTRAINT chk_phone CHECK (Phone REGEXP '^[0-9+\\-() ]{7,20}$')
 );
 
