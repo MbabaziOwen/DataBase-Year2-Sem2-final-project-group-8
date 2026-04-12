@@ -257,63 +257,6 @@ CREATE TABLE AuditLog (
 );
 
 -- ============================================================
---  TRIGGERS
--- ============================================================
-
-DELIMITER $$
-
--- Reduce product stock after a distribution is recorded
-CREATE TRIGGER trg_after_distribution
-AFTER INSERT ON Distributions
-FOR EACH ROW
-BEGIN
-    UPDATE Products
-    SET Quantity = Quantity - NEW.quantity
-    WHERE Product_id = NEW.Product_ID;
-
-END$$
-
--- Block distribution if product is out of stock
-CREATE TRIGGER trg_before_distribution
-BEFORE INSERT ON Distributions
-FOR EACH ROW
-BEGIN
-    DECLARE v_stock INT UNSIGNED;
-    SELECT Quantity INTO v_stock
-    FROM Products WHERE Product_id = NEW.Product_ID;
-    IF v_stock < 1 THEN
-        SIGNAL SQLSTATE '45000'
-            SET MESSAGE_TEXT = 'Cannot distribute: product out of stock.';
-    END IF;
-END$$
-
--- Prevent deleting a Farmers who still has active Plots
-CREATE TRIGGER trg_before_farmer_delete
-BEFORE DELETE ON Farmers
-FOR EACH ROW
-BEGIN
-    DECLARE v_count INT;
-    SELECT COUNT(*) INTO v_count FROM Farms WHERE Farmer_id = OLD.Farmer_id;
-    IF v_count > 0 THEN
-        SIGNAL SQLSTATE '45000'
-            SET MESSAGE_TEXT = 'Cannot delete farmer who still has registered plots.';
-    END IF;
-END$$
-
--- Auto-generate Farmers Registration_number if blank on insert
-CREATE TRIGGER trg_farmer_reg_number
-BEFORE INSERT ON Farmers
-FOR EACH ROW
-BEGIN
-    IF NEW.Registration_number IS NULL OR NEW.Registration_number = '' THEN
-        SET NEW.Registration_number =
-            CONCAT('FRM-', YEAR(CURDATE()), '-', LPAD(NEW.Farmer_id + 1, 4, '0'));
-    END IF;
-END$$
-
-DELIMITER ;
-
--- ============================================================
 --  ALTER TABLES — Add missing EERD columns
 -- ============================================================
 
@@ -390,6 +333,63 @@ ALTER TABLE Distributions
     ADD CONSTRAINT fk_dist_worker
         FOREIGN KEY (worker_id) REFERENCES ExtensionWorkers(Worker_id)
         ON UPDATE CASCADE;
+
+-- ============================================================
+--  TRIGGERS
+-- ============================================================
+
+DELIMITER $$
+
+-- Reduce product stock after a distribution is recorded
+CREATE TRIGGER trg_after_distribution
+AFTER INSERT ON Distributions
+FOR EACH ROW
+BEGIN
+    UPDATE Products
+    SET Quantity = Quantity - NEW.quantity
+    WHERE Product_id = NEW.Product_ID;
+
+END$$
+
+-- Block distribution if product is out of stock
+CREATE TRIGGER trg_before_distribution
+BEFORE INSERT ON Distributions
+FOR EACH ROW
+BEGIN
+    DECLARE v_stock INT UNSIGNED;
+    SELECT Quantity INTO v_stock
+    FROM Products WHERE Product_id = NEW.Product_ID;
+    IF v_stock < NEW.quantity THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Cannot distribute: insufficient stock.';
+    END IF;
+END$$
+
+-- Prevent deleting a Farmers who still has active Plots
+CREATE TRIGGER trg_before_farmer_delete
+BEFORE DELETE ON Farmers
+FOR EACH ROW
+BEGIN
+    DECLARE v_count INT;
+    SELECT COUNT(*) INTO v_count FROM Farms WHERE Farmer_id = OLD.Farmer_id;
+    IF v_count > 0 THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Cannot delete farmer who still has registered plots.';
+    END IF;
+END$$
+
+-- Auto-generate Farmers Registration_number if blank on insert
+CREATE TRIGGER trg_farmer_reg_number
+BEFORE INSERT ON Farmers
+FOR EACH ROW
+BEGIN
+    IF NEW.Registration_number IS NULL OR NEW.Registration_number = '' THEN
+        SET NEW.Registration_number =
+            CONCAT('FRM-', YEAR(CURDATE()), '-', LPAD(NEW.Farmer_id + 1, 4, '0'));
+    END IF;
+END$$
+
+DELIMITER ;
 
 -- ============================================================
 --  SAMPLE DATA  (follows FK dependency order)
@@ -823,7 +823,7 @@ FLUSH PRIVILEGES;
 
 -- Q1: All farmers with their plots and total production
 SELECT
-    fp.Name           AS Farmers,
+    fp.Farmer_Name,
     fp.Registration_number,
     pl.Farm_name,
     pl.Coffee_Type,

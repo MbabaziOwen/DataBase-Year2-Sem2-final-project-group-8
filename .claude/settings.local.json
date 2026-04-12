@@ -1,7 +1,15 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python cleanup_sql.py)"
+      "Bash(python cleanup_sql.py)",
+      "Bash(mysql --version)",
+      "Read(//c/Program Files/MySQL//**)",
+      "Read(//c/Program Files \\(x86\\)/MySQL//**)",
+      "Bash('/c/Program Files/MySQL/MySQL Server 8.0/bin/mysql.exe' -u root -p --connect-timeout=5 -e 'SELECT 1;')",
+      "Bash('/c/Program Files/MySQL/MySQL Server 8.0/bin/mysql.exe' -u root --password= -e 'SELECT 1;')",
+      "Bash('/c/Program Files/MySQL/MySQL Server 8.0/bin/mysql.exe' -u root --password= --force)",
+      "Bash(python fix_sql.py)",
+      "Bash('/c/Program Files/MySQL/MySQL Server 8.0/bin/mysql.exe' -u root --password=)"
     ]
   }
 }
