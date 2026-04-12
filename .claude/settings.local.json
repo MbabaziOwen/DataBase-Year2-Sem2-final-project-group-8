@@ -9,7 +9,11 @@
       "Bash('/c/Program Files/MySQL/MySQL Server 8.0/bin/mysql.exe' -u root --password= -e 'SELECT 1;')",
       "Bash('/c/Program Files/MySQL/MySQL Server 8.0/bin/mysql.exe' -u root --password= --force)",
       "Bash(python fix_sql.py)",
-      "Bash('/c/Program Files/MySQL/MySQL Server 8.0/bin/mysql.exe' -u root --password=)"
+      "Bash('/c/Program Files/MySQL/MySQL Server 8.0/bin/mysql.exe' -u root --password=)",
+      "Bash(python milestone3_fix.py)",
+      "Bash(python milestone4_fix.py)",
+      "Bash('/c/Program Files/MySQL/MySQL Server 8.0/bin/mysql.exe' -u root --password= -e 'SELECT VERSION\\(\\), @@version_comment;')",
+      "Bash(python fix_roles.py)"
     ]
   }
 }

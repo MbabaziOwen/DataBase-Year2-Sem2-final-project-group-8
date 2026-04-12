@@ -327,12 +327,64 @@ ALTER TABLE Products
 
 -- Distributions: worker_id (nullable — EW who assisted), quantity, notes
 ALTER TABLE Distributions
-    ADD COLUMN worker_id INT UNSIGNED NOT NULL DEFAULT 1 AFTER Staff_ID,
+    ADD COLUMN worker_id INT UNSIGNED NULL AFTER Staff_ID,
     ADD COLUMN quantity  INT UNSIGNED NOT NULL DEFAULT 1 AFTER worker_id,
     ADD COLUMN notes     TEXT         NULL               AFTER quantity,
     ADD CONSTRAINT fk_dist_worker
         FOREIGN KEY (worker_id) REFERENCES ExtensionWorkers(Worker_id)
         ON UPDATE CASCADE;
+
+
+-- ============================================================
+--  VALIDATION CONSTRAINTS (operational rules)
+-- ============================================================
+
+-- Persons: name ≥2 chars, phone ≥10 chars, email must contain @ and a dot
+ALTER TABLE Persons
+    ADD CONSTRAINT chk_name_len   CHECK (LENGTH(TRIM(Name)) >= 2),
+    ADD CONSTRAINT chk_phone_len  CHECK (LENGTH(TRIM(Phone)) >= 10),
+    ADD CONSTRAINT chk_email_fmt  CHECK (Email IS NULL
+                                          OR (Email LIKE '%@%.%' AND LENGTH(Email) >= 6));
+
+-- ExtensionWorkers: Status restricted to known operational values
+ALTER TABLE ExtensionWorkers
+    MODIFY COLUMN Status ENUM('Active','Inactive','On Leave','Suspended')
+                         NOT NULL DEFAULT 'Active';
+
+-- SystemAdmin: Status and Access_level restricted to known values
+ALTER TABLE SystemAdmin
+    MODIFY COLUMN Status       ENUM('Active','Inactive','Suspended')
+                               NOT NULL DEFAULT 'Active',
+    MODIFY COLUMN Access_level ENUM('Administrator','Supervisor','Operator')
+                               NOT NULL;
+
+-- Farms: Coffee_Type restricted, size has upper bound, GPS ranges enforced
+ALTER TABLE Farms
+    ADD CONSTRAINT chk_coffee_type CHECK (Coffee_Type IN ('Arabica','Robusta','Liberica','Hybrid')),
+    ADD CONSTRAINT chk_size_max    CHECK (Size_acres <= 5000),
+    ADD CONSTRAINT chk_gps_lat     CHECK (gps_latitude  IS NULL
+                                           OR gps_latitude  BETWEEN -90  AND  90),
+    ADD CONSTRAINT chk_gps_lon     CHECK (gps_longitude IS NULL
+                                           OR gps_longitude BETWEEN -180 AND 180);
+
+-- FarmVarieties: at least 1 tree must be recorded
+ALTER TABLE FarmVarieties
+    ADD CONSTRAINT chk_trees_pos CHECK (trees_count > 0);
+
+-- CoffeeVarieties: maturity realistic (1–60 months); yield must be positive
+ALTER TABLE CoffeeVarieties
+    ADD CONSTRAINT chk_var_maturity CHECK (maturity_months IS NULL
+                                            OR maturity_months BETWEEN 1 AND 60),
+    ADD CONSTRAINT chk_var_yield    CHECK (avg_yield_kg_tree IS NULL
+                                            OR avg_yield_kg_tree > 0);
+
+-- Products: price must be positive when provided
+ALTER TABLE Products
+    ADD CONSTRAINT chk_prod_cost CHECK (unit_cost_ugx IS NULL OR unit_cost_ugx > 0);
+
+-- Distributions: quantity must be positive (worker_id is already nullable — optional EW)
+ALTER TABLE Distributions
+    ADD CONSTRAINT chk_dist_qty CHECK (quantity > 0);
 
 -- ============================================================
 --  TRIGGERS
@@ -378,16 +430,130 @@ BEGIN
     END IF;
 END$$
 
--- Auto-generate Farmers Registration_number if blank on insert
+-- Auto-generate Registration_number; block future registration dates
 CREATE TRIGGER trg_farmer_reg_number
 BEFORE INSERT ON Farmers
 FOR EACH ROW
 BEGIN
+    IF NEW.Registration_date > CURDATE() THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Registration_date cannot be in the future.';
+    END IF;
     IF NEW.Registration_number IS NULL OR NEW.Registration_number = '' THEN
         SET NEW.Registration_number =
             CONCAT('FRM-', YEAR(CURDATE()), '-', LPAD(NEW.Farmer_id + 1, 4, '0'));
     END IF;
 END$$
+
+-- Hire_date must not be in the future
+CREATE TRIGGER trg_before_extworker_insert
+BEFORE INSERT ON ExtensionWorkers
+FOR EACH ROW
+BEGIN
+    IF NEW.Hire_date > CURDATE() THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Hire_date cannot be in the future.';
+    END IF;
+END$$
+
+CREATE TRIGGER trg_before_staff_insert
+BEFORE INSERT ON MinistryStaff
+FOR EACH ROW
+BEGIN
+    IF NEW.Hire_date > CURDATE() THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Hire_date cannot be in the future.';
+    END IF;
+END$$
+
+-- Visit_date must not be in the future
+CREATE TRIGGER trg_before_visit_insert
+BEFORE INSERT ON FarmVisits
+FOR EACH ROW
+BEGIN
+    IF NEW.Visit_date > CURDATE() THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Visit_date cannot be in the future.';
+    END IF;
+END$$
+
+-- Record_date must not be in the future
+CREATE TRIGGER trg_before_production_insert
+BEFORE INSERT ON ProductionRecords
+FOR EACH ROW
+BEGIN
+    IF NEW.Record_date > CURDATE() THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Record_date cannot be in the future.';
+    END IF;
+END$$
+
+-- ── AuditLog population triggers ──────────────────────────
+-- Farmers: log INSERT and UPDATE
+CREATE TRIGGER trg_audit_farmer_insert
+AFTER INSERT ON Farmers
+FOR EACH ROW
+BEGIN
+    INSERT INTO AuditLog (table_name, operation, record_id, new_value, performed_by)
+    VALUES ('Farmers', 'INSERT', NEW.Farmer_id,
+            JSON_OBJECT(
+                'Farmer_id',          NEW.Farmer_id,
+                'Registration_number',NEW.Registration_number,
+                'Registration_date',  NEW.Registration_date,
+                'Person_id',          NEW.Person_id
+            ),
+            CURRENT_USER());
+END$$
+
+CREATE TRIGGER trg_audit_farmer_update
+AFTER UPDATE ON Farmers
+FOR EACH ROW
+BEGIN
+    INSERT INTO AuditLog (table_name, operation, record_id, old_value, new_value, performed_by)
+    VALUES ('Farmers', 'UPDATE', NEW.Farmer_id,
+            JSON_OBJECT('Registration_number', OLD.Registration_number,
+                        'is_coop_member',      OLD.is_coop_member,
+                        'total_trees',         OLD.total_trees),
+            JSON_OBJECT('Registration_number', NEW.Registration_number,
+                        'is_coop_member',      NEW.is_coop_member,
+                        'total_trees',         NEW.total_trees),
+            CURRENT_USER());
+END$$
+
+-- ProductionRecords: log every new harvest entry
+CREATE TRIGGER trg_audit_production_insert
+AFTER INSERT ON ProductionRecords
+FOR EACH ROW
+BEGIN
+    INSERT INTO AuditLog (table_name, operation, record_id, new_value, performed_by)
+    VALUES ('ProductionRecords', 'INSERT', NEW.Production_id,
+            JSON_OBJECT(
+                'Farm_id',    NEW.Farm_id,
+                'Season',     NEW.Season,
+                'Quantity',   NEW.Quantity,
+                'Worker_id',  NEW.Worker_id,
+                'Record_date',NEW.Record_date
+            ),
+            CURRENT_USER());
+END$$
+
+-- Distributions: log every product distribution
+CREATE TRIGGER trg_audit_dist_insert
+AFTER INSERT ON Distributions
+FOR EACH ROW
+BEGIN
+    INSERT INTO AuditLog (table_name, operation, record_id, new_value, performed_by)
+    VALUES ('Distributions', 'INSERT', NEW.Distribution_id,
+            JSON_OBJECT(
+                'Product_ID',        NEW.Product_ID,
+                'Farmer_ID',         NEW.Farmer_ID,
+                'quantity',          NEW.quantity,
+                'Staff_ID',          NEW.Staff_ID,
+                'Distribution_date', NEW.Distribution_date
+            ),
+            CURRENT_USER());
+END$$
+
 
 DELIMITER ;
 
@@ -655,6 +821,29 @@ JOIN Village           v  ON pl.Village_ID = v.Village_ID
 JOIN Subcounty         sc ON v.Subcounty_ID = sc.Subcounty_ID
 JOIN Districts          d  ON sc.District_ID = d.District_ID;
 
+
+-- Farm activity summary — uses COALESCE, DATEDIFF, DATE_FORMAT, IF, UPPER
+CREATE OR REPLACE VIEW vw_FarmActivitySummary AS
+SELECT
+    f.Farm_id,
+    f.Farm_name,
+    UPPER(f.Coffee_Type)                              AS Coffee_Type,
+    f.Size_acres,
+    COALESCE(SUM(pr.Quantity), 0)                    AS Total_kg_Produced,
+    COUNT(DISTINCT pr.Production_id)                  AS Total_Harvests,
+    DATE_FORMAT(MAX(pr.Record_date), '%d %b %Y')     AS Last_Harvest_Date,
+    DATEDIFF(CURDATE(), MAX(pr.Record_date))          AS Days_Since_Harvest,
+    COUNT(DISTINCT fv.Visit_id)                       AS Total_Visits,
+    DATE_FORMAT(MAX(fv.Visit_date), '%d %b %Y')      AS Last_Visit_Date,
+    IF(f.is_active = 1, 'Active', 'Inactive')        AS Farm_Status,
+    pp.Name                                           AS Owner_Name
+FROM Farms f
+LEFT JOIN ProductionRecords pr ON f.Farm_id   = pr.Farm_id
+LEFT JOIN FarmVisits fv        ON f.Farm_id   = fv.Farm_id
+JOIN  Farmers fa               ON f.Farmer_id = fa.Farmer_id
+JOIN  vw_PersonProfile pp      ON fa.Person_id = pp.Person_id
+GROUP BY f.Farm_id, f.Farm_name, f.Coffee_Type, f.Size_acres, f.is_active, pp.Name;
+
 -- ============================================================
 --  STORED PROCEDURES
 -- ============================================================
@@ -704,7 +893,7 @@ CREATE PROCEDURE sp_RecordProduction(
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM Farms WHERE Farm_id = p_plot_id) THEN
         SIGNAL SQLSTATE '45000'
-            SET MESSAGE_TEXT = 'Farms does not exist.';
+            SET MESSAGE_TEXT = 'Farm does not exist.';
     END IF;
 
     INSERT INTO ProductionRecords (Season, Record_date, Quantity, Farm_id, Worker_id)
@@ -720,23 +909,29 @@ CREATE PROCEDURE sp_DistributeProduct(
     IN  p_farmer_id    INT UNSIGNED,
     IN  p_plot_id      INT UNSIGNED,
     IN  p_staff_id     INT UNSIGNED,
+    IN  p_quantity     INT UNSIGNED,
     OUT p_dist_id      INT UNSIGNED
 )
 BEGIN
     DECLARE v_stock INT UNSIGNED;
 
+    IF p_quantity < 1 THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Quantity must be at least 1.';
+    END IF;
+
     SELECT Quantity INTO v_stock
     FROM Products WHERE Product_id = p_product_id;
 
-    IF v_stock < 1 THEN
+    IF v_stock < p_quantity THEN
         SIGNAL SQLSTATE '45000'
             SET MESSAGE_TEXT = 'Insufficient stock for distribution.';
     END IF;
 
     INSERT INTO Distributions
-        (Product_type, Distribution_date, Product_ID, Farmer_ID, Farm_id, Staff_ID)
+        (Product_type, Distribution_date, Product_ID, Farmer_ID, Farm_id, Staff_ID, quantity)
     VALUES
-        (p_product_type, CURDATE(), p_product_id, p_farmer_id, p_plot_id, p_staff_id);
+        (p_product_type, CURDATE(), p_product_id, p_farmer_id, p_plot_id, p_staff_id, p_quantity);
 
     SET p_dist_id = LAST_INSERT_ID();
 END$$
@@ -778,42 +973,190 @@ BEGIN
     ORDER BY pr.Season DESC;
 END$$
 
+-- Register a new extension worker (creates Persons + ExtensionWorkers in one call)
+CREATE PROCEDURE sp_RegisterExtensionWorker(
+    IN  p_name        VARCHAR(120),
+    IN  p_nin         VARCHAR(20),
+    IN  p_gender      VARCHAR(10),
+    IN  p_phone       VARCHAR(20),
+    IN  p_email       VARCHAR(120),
+    IN  p_address     VARCHAR(255),
+    IN  p_village_id  INT UNSIGNED,
+    IN  p_qual        VARCHAR(100),
+    IN  p_hire_date   DATE,
+    IN  p_district_id INT UNSIGNED,
+    OUT p_worker_id   INT UNSIGNED
+)
+BEGIN
+    DECLARE v_person_id INT UNSIGNED;
+
+    IF EXISTS (SELECT 1 FROM Persons WHERE National_ID = p_nin) THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'National_ID already registered.';
+    END IF;
+
+    IF p_hire_date > CURDATE() THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Hire_date cannot be in the future.';
+    END IF;
+
+    INSERT INTO Persons (Name, National_ID, Gender, Phone, Email, Address, Village_ID)
+    VALUES (p_name, p_nin, p_gender, p_phone, p_email, p_address, p_village_id);
+
+    SET v_person_id = LAST_INSERT_ID();
+
+    INSERT INTO ExtensionWorkers (Qualification, Hire_date, Status, District_ID, Person_id)
+    VALUES (p_qual, p_hire_date, 'Active', p_district_id, v_person_id);
+
+    SET p_worker_id = LAST_INSERT_ID();
+END$$
+
+-- Record a farm visit
+CREATE PROCEDURE sp_RecordFarmVisit(
+    IN  p_purpose      VARCHAR(200),
+    IN  p_visit_date   DATE,
+    IN  p_findings     TEXT,
+    IN  p_followup     DATE,
+    IN  p_worker_id    INT UNSIGNED,
+    IN  p_farmer_id    INT UNSIGNED,
+    IN  p_farm_id      INT UNSIGNED,
+    OUT p_visit_id     INT UNSIGNED
+)
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM Farms WHERE Farm_id = p_farm_id) THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Farm does not exist.';
+    END IF;
+
+    IF NOT EXISTS (SELECT 1 FROM ExtensionWorkers WHERE Worker_id = p_worker_id) THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Extension worker does not exist.';
+    END IF;
+
+    IF p_visit_date > CURDATE() THEN
+        SIGNAL SQLSTATE '45000'
+            SET MESSAGE_TEXT = 'Visit_date cannot be in the future.';
+    END IF;
+
+    INSERT INTO FarmVisits (Visit_purpose, Visit_date, Findings, Follow_up_date,
+                            Worker_id, Farmer_ID, Farm_id)
+    VALUES (p_purpose, p_visit_date, p_findings, p_followup,
+            p_worker_id, p_farmer_id, p_farm_id);
+
+    SET p_visit_id = LAST_INSERT_ID();
+END$$
+
+-- Create timestamped in-database snapshot of critical tables
+CREATE PROCEDURE sp_BackupKeyTables()
+BEGIN
+    DECLARE v_sfx VARCHAR(20) DEFAULT DATE_FORMAT(NOW(), '%Y%m%d_%H%i');
+
+    SET @s = CONCAT('CREATE TABLE bkp_Farmers_',           v_sfx, ' AS SELECT * FROM Farmers');
+    PREPARE st FROM @s; EXECUTE st; DEALLOCATE PREPARE st;
+
+    SET @s = CONCAT('CREATE TABLE bkp_Farms_',             v_sfx, ' AS SELECT * FROM Farms');
+    PREPARE st FROM @s; EXECUTE st; DEALLOCATE PREPARE st;
+
+    SET @s = CONCAT('CREATE TABLE bkp_ProductionRecords_', v_sfx, ' AS SELECT * FROM ProductionRecords');
+    PREPARE st FROM @s; EXECUTE st; DEALLOCATE PREPARE st;
+
+    SET @s = CONCAT('CREATE TABLE bkp_Distributions_',     v_sfx, ' AS SELECT * FROM Distributions');
+    PREPARE st FROM @s; EXECUTE st; DEALLOCATE PREPARE st;
+
+    SELECT CONCAT('Snapshot created: ', v_sfx) AS backup_status;
+END$$
+
+
 DELIMITER ;
 
 -- ============================================================
 --  USER ROLES AND PRIVILEGES
 -- ============================================================
 
+-- ── Drop existing users and roles ────────────────────────────
 DROP USER IF EXISTS 'g8_admin'@'localhost';
 DROP USER IF EXISTS 'g8_ext_worker'@'localhost';
 DROP USER IF EXISTS 'g8_analyst'@'localhost';
 DROP USER IF EXISTS 'g8_readonly'@'localhost';
 
--- Database administrator — full control
-CREATE USER 'g8_admin'@'localhost' IDENTIFIED BY 'Admin@G8_2024!';
-GRANT ALL PRIVILEGES ON agricultural_services_db.* TO 'g8_admin'@'localhost' WITH GRANT OPTION;
+DROP ROLE IF EXISTS role_db_admin;
+DROP ROLE IF EXISTS role_field_worker;
+DROP ROLE IF EXISTS role_data_analyst;
+DROP ROLE IF EXISTS role_portal_viewer;
 
--- Extension Worker — can record visits and production
-CREATE USER 'g8_ext_worker'@'localhost' IDENTIFIED BY 'Worker@G8_2024!';
-GRANT SELECT  ON agricultural_services_db.*                       TO 'g8_ext_worker'@'localhost';
-GRANT INSERT, UPDATE ON agricultural_services_db.FarmVisits        TO 'g8_ext_worker'@'localhost';
-GRANT INSERT, UPDATE ON agricultural_services_db.ProductionRecords TO 'g8_ext_worker'@'localhost';
-GRANT EXECUTE ON PROCEDURE agricultural_services_db.sp_RecordProduction TO 'g8_ext_worker'@'localhost';
-GRANT EXECUTE ON PROCEDURE agricultural_services_db.sp_FarmerProductionReport TO 'g8_ext_worker'@'localhost';
+-- ── Create user accounts with authentication policies ─────────
+-- Password expires every 180 days; account created for each function
+CREATE USER 'g8_admin'@'localhost'
+    IDENTIFIED BY 'Admin@G8_2024!'
+    PASSWORD EXPIRE INTERVAL 180 DAY;
 
--- Data analyst — read only + report procedures
-CREATE USER 'g8_analyst'@'localhost' IDENTIFIED BY 'Analyst@G8_2024!';
-GRANT SELECT ON agricultural_services_db.* TO 'g8_analyst'@'localhost';
-GRANT EXECUTE ON PROCEDURE agricultural_services_db.sp_FarmerProductionReport      TO 'g8_analyst'@'localhost';
-GRANT EXECUTE ON PROCEDURE agricultural_services_db.sp_DistrictProductionSummary   TO 'g8_analyst'@'localhost';
+CREATE USER 'g8_ext_worker'@'localhost'
+    IDENTIFIED BY 'Worker@G8_2024!'
+    PASSWORD EXPIRE INTERVAL 180 DAY;
 
--- Read-only portal user
-CREATE USER 'g8_readonly'@'localhost' IDENTIFIED BY 'ReadOnly@G8_2024!';
-GRANT SELECT ON agricultural_services_db.vw_FarmerProfile    TO 'g8_readonly'@'localhost';
-GRANT SELECT ON agricultural_services_db.vw_FarmSummary      TO 'g8_readonly'@'localhost';
-GRANT SELECT ON agricultural_services_db.vw_ProductionHistory TO 'g8_readonly'@'localhost';
-GRANT SELECT ON agricultural_services_db.vw_DistributionLog  TO 'g8_readonly'@'localhost';
-GRANT SELECT ON agricultural_services_db.vw_VisitHistory     TO 'g8_readonly'@'localhost';
+CREATE USER 'g8_analyst'@'localhost'
+    IDENTIFIED BY 'Analyst@G8_2024!'
+    PASSWORD EXPIRE INTERVAL 180 DAY;
+
+CREATE USER 'g8_readonly'@'localhost'
+    IDENTIFIED BY 'ReadOnly@G8_2024!'
+    PASSWORD EXPIRE INTERVAL 365 DAY;
+
+-- ── Create roles ──────────────────────────────────────────────
+CREATE ROLE role_db_admin;
+CREATE ROLE role_field_worker;
+CREATE ROLE role_data_analyst;
+CREATE ROLE role_portal_viewer;
+
+-- ── role_db_admin: full database control ─────────────────────
+GRANT ALL PRIVILEGES ON agricultural_services_db.*
+    TO role_db_admin WITH GRANT OPTION;
+
+-- ── role_field_worker: write visits + production; read farm data only ─
+-- (SELECT on raw Persons table is intentionally excluded — no access to
+--  National_ID or private contact details of other staff)
+GRANT SELECT ON agricultural_services_db.Farms             TO role_field_worker;
+GRANT SELECT ON agricultural_services_db.Farmers           TO role_field_worker;
+GRANT SELECT ON agricultural_services_db.FarmVisits        TO role_field_worker;
+GRANT SELECT ON agricultural_services_db.ProductionRecords TO role_field_worker;
+GRANT SELECT ON agricultural_services_db.CoffeeVarieties   TO role_field_worker;
+GRANT SELECT ON agricultural_services_db.FarmVarieties     TO role_field_worker;
+GRANT INSERT, UPDATE ON agricultural_services_db.FarmVisits        TO role_field_worker;
+GRANT INSERT, UPDATE ON agricultural_services_db.ProductionRecords TO role_field_worker;
+GRANT EXECUTE ON PROCEDURE agricultural_services_db.sp_RecordProduction       TO role_field_worker;
+GRANT EXECUTE ON PROCEDURE agricultural_services_db.sp_RecordFarmVisit        TO role_field_worker;
+GRANT EXECUTE ON PROCEDURE agricultural_services_db.sp_FarmerProductionReport TO role_field_worker;
+
+-- ── role_data_analyst: read-only on views; no raw sensitive tables ──
+GRANT SELECT ON agricultural_services_db.vw_PersonProfile       TO role_data_analyst;
+GRANT SELECT ON agricultural_services_db.vw_FarmerProfile       TO role_data_analyst;
+GRANT SELECT ON agricultural_services_db.vw_FarmSummary         TO role_data_analyst;
+GRANT SELECT ON agricultural_services_db.vw_ProductionHistory   TO role_data_analyst;
+GRANT SELECT ON agricultural_services_db.vw_DistributionLog     TO role_data_analyst;
+GRANT SELECT ON agricultural_services_db.vw_VisitHistory        TO role_data_analyst;
+GRANT SELECT ON agricultural_services_db.vw_FarmActivitySummary TO role_data_analyst;
+GRANT EXECUTE ON PROCEDURE agricultural_services_db.sp_FarmerProductionReport    TO role_data_analyst;
+GRANT EXECUTE ON PROCEDURE agricultural_services_db.sp_DistrictProductionSummary TO role_data_analyst;
+
+-- ── role_portal_viewer: public-facing read-only on non-sensitive views only ─
+GRANT SELECT ON agricultural_services_db.vw_FarmerProfile       TO role_portal_viewer;
+GRANT SELECT ON agricultural_services_db.vw_FarmSummary         TO role_portal_viewer;
+GRANT SELECT ON agricultural_services_db.vw_ProductionHistory   TO role_portal_viewer;
+GRANT SELECT ON agricultural_services_db.vw_DistributionLog     TO role_portal_viewer;
+GRANT SELECT ON agricultural_services_db.vw_VisitHistory        TO role_portal_viewer;
+GRANT SELECT ON agricultural_services_db.vw_FarmActivitySummary TO role_portal_viewer;
+
+-- ── Assign roles to users ─────────────────────────────────────
+GRANT role_db_admin      TO 'g8_admin'@'localhost';
+GRANT role_field_worker  TO 'g8_ext_worker'@'localhost';
+GRANT role_data_analyst  TO 'g8_analyst'@'localhost';
+GRANT role_portal_viewer TO 'g8_readonly'@'localhost';
+
+-- ── Activate roles automatically on login ─────────────────────
+SET DEFAULT ROLE role_db_admin      FOR 'g8_admin'@'localhost';
+SET DEFAULT ROLE role_field_worker  FOR 'g8_ext_worker'@'localhost';
+SET DEFAULT ROLE role_data_analyst  FOR 'g8_analyst'@'localhost';
+SET DEFAULT ROLE role_portal_viewer FOR 'g8_readonly'@'localhost';
 
 FLUSH PRIVILEGES;
 
@@ -873,3 +1216,56 @@ LEFT JOIN MinistryStaff ms ON p.Person_id = ms.Person_id
 LEFT JOIN SystemAdmin   sa ON p.Person_id = sa.Person_id
 WHERE ms.StaffID IS NOT NULL OR sa.AdminID IS NOT NULL;
 
+-- Q7: Farm activity summary (uses COALESCE, DATEDIFF, DATE_FORMAT, IF, UPPER)
+SELECT Farm_name, Coffee_Type, Total_kg_Produced,
+       Total_Harvests, Last_Harvest_Date, Days_Since_Harvest,
+       Total_Visits, Farm_Status, Owner_Name
+FROM vw_FarmActivitySummary
+ORDER BY Total_kg_Produced DESC;
+
+
+-- ============================================================
+--  BACKUP AND RECOVERY
+-- ============================================================
+
+-- ── Strategy 1: Full database dump (run from OS terminal) ────
+--
+--   BACKUP:
+--     mysqldump -u g8_admin -p agricultural_services_db \
+--               > backup_$(date +%Y-%m-%d).sql
+--
+--   SELECTIVE (core tables only):
+--     mysqldump -u g8_admin -p agricultural_services_db \
+--               Farmers Farms ProductionRecords Distributions CoffeeVarieties \
+--               > core_backup_$(date +%Y-%m-%d).sql
+--
+--   RESTORE:
+--     mysql -u root -p agricultural_services_db \
+--           < backup_2024-07-01.sql
+--
+-- ── Strategy 2: In-database snapshot (call anytime) ──────────
+--
+--   Creates timestamped copies of critical tables inside the DB:
+--     CALL sp_BackupKeyTables();
+--   This creates tables named e.g. bkp_Farmers_20240701_0900
+--
+-- ── Strategy 3: Scheduled AuditLog maintenance ───────────────
+--   Requires Event Scheduler enabled on the server:
+--     SET GLOBAL event_scheduler = ON;
+--
+--   The event below purges AuditLog rows older than 1 year weekly.
+
+CREATE EVENT IF NOT EXISTS evt_auditlog_cleanup
+ON SCHEDULE EVERY 1 WEEK
+STARTS CURRENT_TIMESTAMP
+COMMENT 'Remove AuditLog entries older than 1 year to control table growth'
+DO DELETE FROM AuditLog
+   WHERE performed_at < DATE_SUB(NOW(), INTERVAL 1 YEAR);
+
+-- ── Recovery checklist ───────────────────────────────────────
+-- 1. Stop application connections before restoring.
+-- 2. Run: DROP DATABASE IF EXISTS agricultural_services_db;
+-- 3. Run: CREATE DATABASE agricultural_services_db ...
+-- 4. Restore from the most recent .sql dump.
+-- 5. Verify row counts match pre-failure state.
+-- 6. Re-enable application connections.
